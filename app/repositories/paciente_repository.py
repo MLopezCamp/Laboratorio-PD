@@ -15,18 +15,10 @@ def create(db: Session, paciente_data):
     return paciente
 
 
-def get_all_paginated(db: Session, skip: int, limit: int, documento: str = None):
+def get_all(db: Session, documento: str = None):
     query = db.query(Paciente)
 
     if documento:
         query = query.filter(Paciente.documento == documento)
 
-    total = query.count()
-    data = query.offset(skip).limit(limit).all()
-
-    return {
-        "total": total,
-        "skip": skip,
-        "limit": limit,
-        "data": data
-    }
+    return query.all()

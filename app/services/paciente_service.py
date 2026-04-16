@@ -19,18 +19,12 @@ def crear_paciente(paciente: PacienteCreate):
         db.close()
 
 
-def listar_pacientes(page: int = 1, limit: int = 10, documento: str = None):
+
+def listar_pacientes(documento: str = None):
     db = SessionLocal()
 
     try:
-        skip = (page - 1) * limit  # 🔥 AQUÍ está la corrección clave
-
-        return paciente_repository.get_all_paginated(
-            db,
-            skip,
-            limit,
-            documento
-        )
+        return paciente_repository.get_all(db, documento)
 
     finally:
         db.close()

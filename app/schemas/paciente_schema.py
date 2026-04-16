@@ -14,10 +14,3 @@ class PacienteResponse(BaseModel):
 
     class Config:
         from_attributes = True
-
-
-class PacientePaginatedResponse(BaseModel):
-    total: int
-    skip: int
-    limit: int
-    data: List[PacienteResponse]
