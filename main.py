@@ -7,10 +7,18 @@ Dependencias:
     pip install fastapi uvicorn httpx redis pydantic
 
 Descripción:
-    Este servicio actúa como orquestador del sistema distribuido de citas médicas.
-    Coordina los servicios de Pacientes (G1), Doctores (G2), Citas (G3),
-    Pagos (G4) y Notificaciones (G5) siguiendo un flujo secuencial con
-    validaciones cruzadas y control de concurrencia via Redis.
+    Orquestador del sistema distribuido de citas médicas.
+    Expone proxies hacia todos los servicios (G1–G5) y coordina
+    el flujo completo de creación de una cita con control de
+    concurrencia via Redis.
+
+Endpoints disponibles:
+    PACIENTES  (Grupo 1)  POST /crear_paciente          |  GET /pacientes  |  GET /pacientes/{id}
+    DOCTORES   (Grupo 2)  POST /crear_doctor             |  GET /doctores   |  GET /disponibilidad/{id}
+    CITAS      (Grupo 3)  GET  /citas  |  GET /citas/{id}|  DELETE /cancelar_cita/{id}
+    PAGOS      (Grupo 4)  GET  /pagos  |  GET /pagos/{cita_id}
+    ORQUESTA   (Grupo 6)  POST /orquestar_cita
+    SALUD                 GET  /estado_servicios         |  GET /health
 """
 
 from fastapi import FastAPI, HTTPException, status
@@ -21,7 +29,7 @@ from typing import Optional
 import logging
 
 # ---------------------------------------------------------------------------
-# Configuración básica de logging
+# Logging
 # ---------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -32,7 +40,7 @@ log = logging.getLogger(__name__)
 app = FastAPI(
     title="Servicio Coordinador - Grupo 6",
     description="Orquestador del sistema distribuido de citas médicas",
-    version="2.0",
+    version="3.0",
 )
 
 # ---------------------------------------------------------------------------
@@ -42,17 +50,17 @@ r = redis.Redis(host="localhost", port=6379, decode_responses=True)
 
 # ---------------------------------------------------------------------------
 # URLs de los servicios externos
-# Ajusta estas IPs/puertos según lo que cada grupo haya definido
+# Ajusta las IPs/puertos según lo que cada grupo defina en su máquina
 # ---------------------------------------------------------------------------
-PACIENTES_URL      = "http://172.16.0.193:8000"   # Grupo 1 - Pacientes
-DOCTORES_URL       = "http://172.16.0.193:8000"   # Grupo 2 - Doctores
-CITAS_URL          = "http://localhost:8003"   # Grupo 3 - Citas
-PAGOS_URL          = "http://172.16.0.160:8004"   # Grupo 4 - Pagos
+PACIENTES_URL      = "http://172.16.0.253:9000"   # Grupo 1 - Pacientes
+DOCTORES_URL       = "http://172.16.0.232:8003"   # Grupo 2 - Doctores
+CITAS_URL          = "http://172.16.0.198:8001"   # Grupo 3 - Citas
+PAGOS_URL          = "http://172.16.0.159:8004"   # Grupo 4 - Pagos
 NOTIFICACIONES_URL = "http://localhost:8005"   # Grupo 5 - Notificaciones
 
-TIMEOUT_CORTO  = 5   # segundos para GETs simples
-TIMEOUT_NORMAL = 10  # segundos para POSTs normales
-TIMEOUT_LARGO  = 20  # segundos para pagos (simulan delay)
+TIMEOUT_CORTO  = 5    # GETs simples
+TIMEOUT_NORMAL = 10   # POSTs normales
+TIMEOUT_LARGO  = 20   # Pagos (simulan delay interno)
 
 # ---------------------------------------------------------------------------
 # Modelos de entrada
@@ -63,11 +71,17 @@ class CrearPacienteRequest(BaseModel):
     email:  str = Field(..., example="ana@correo.com")
 
 
+class CrearDoctorRequest(BaseModel):
+    nombre:       str = Field(..., example="Dr. Juan Pérez")
+    especialidad: str = Field(..., example="Medicina General")
+    email:        str = Field(..., example="dr.juan@hospital.com")
+
+
 class OrquestacionRequest(BaseModel):
-    paciente_id: int   = Field(..., example=1,       description="ID del paciente ya registrado")
-    doctor_id:   int   = Field(..., example=3,       description="ID del doctor ya registrado")
-    horario:     str   = Field(..., example="2025-07-10T10:00", description="Horario ISO 8601")
-    monto:       float = Field(..., example=50000.0, description="Monto del pago en pesos")
+    paciente_id: str   = Field(..., example=1,                  description="ID del paciente ya registrado")
+    doctor_id:   int   = Field(..., example=3,                  description="ID del doctor ya registrado")
+    horario:     str   = Field(..., example="2025-07-10T10:00", description="Horario en formato ISO 8601")
+    monto:       float = Field(..., example=50000.0,            description="Monto del pago en pesos")
 
 
 # ---------------------------------------------------------------------------
@@ -75,13 +89,13 @@ class OrquestacionRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 async def http_get(client: httpx.AsyncClient, url: str, timeout: float = TIMEOUT_CORTO) -> dict:
-    """GET genérico. Lanza HTTPException si el servicio falla."""
+    """GET genérico con manejo de errores unificado."""
     try:
         resp = await client.get(url, timeout=timeout)
         resp.raise_for_status()
         return resp.json()
     except httpx.TimeoutException:
-        raise HTTPException(status_code=504, detail=f"Timeout al consultar {url}")
+        raise HTTPException(status_code=504, detail=f"Timeout al consultar: {url}")
     except httpx.ConnectError:
         raise HTTPException(status_code=503, detail=f"Servicio no disponible: {url}")
     except httpx.HTTPStatusError as e:
@@ -91,13 +105,13 @@ async def http_get(client: httpx.AsyncClient, url: str, timeout: float = TIMEOUT
 
 async def http_post(client: httpx.AsyncClient, url: str, payload: dict,
                     timeout: float = TIMEOUT_NORMAL) -> dict:
-    """POST genérico. Lanza HTTPException si el servicio falla."""
+    """POST genérico con manejo de errores unificado."""
     try:
         resp = await client.post(url, json=payload, timeout=timeout)
         resp.raise_for_status()
         return resp.json()
     except httpx.TimeoutException:
-        raise HTTPException(status_code=504, detail=f"Timeout al llamar {url}")
+        raise HTTPException(status_code=504, detail=f"Timeout al llamar: {url}")
     except httpx.ConnectError:
         raise HTTPException(status_code=503, detail=f"Servicio no disponible: {url}")
     except httpx.HTTPStatusError as e:
@@ -105,95 +119,224 @@ async def http_post(client: httpx.AsyncClient, url: str, payload: dict,
                             detail=f"Error en servicio externo ({url}): {e.response.text}")
 
 
-# ---------------------------------------------------------------------------
-# Endpoint: Proxy crear paciente (delega al Grupo 1)
-# ---------------------------------------------------------------------------
+async def http_delete(client: httpx.AsyncClient, url: str, timeout: float = TIMEOUT_NORMAL) -> dict:
+    """DELETE genérico con manejo de errores unificado."""
+    try:
+        resp = await client.delete(url, timeout=timeout)
+        resp.raise_for_status()
+        return resp.json()
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail=f"Timeout al llamar: {url}")
+    except httpx.ConnectError:
+        raise HTTPException(status_code=503, detail=f"Servicio no disponible: {url}")
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=e.response.status_code,
+                            detail=f"Error en servicio externo ({url}): {e.response.text}")
 
-@app.post("/crear_paciente", status_code=201, tags=["Pacientes"])
+
+# ===========================================================================
+# GRUPO 1 — PACIENTES
+# ===========================================================================
+
+@app.post("/crear_paciente", status_code=201, tags=["Pacientes - Grupo 1"])
 async def crear_paciente(datos: CrearPacienteRequest):
     """
-    Proxy hacia el servicio de Pacientes (Grupo 1).
-    Crea un nuevo paciente validando que no exista duplicado.
+    [Grupo 1] Crea un nuevo paciente en el sistema.
+    Delega al servicio de Pacientes que valida duplicados internamente.
     """
-    log.info(f"Creando paciente: {datos.nombre}")
+    log.info(f"Creando paciente: {datos.nombre} | {datos.email}")
     async with httpx.AsyncClient() as client:
-        resultado = await http_post(
+        return await http_post(
             client,
-            f"{PACIENTES_URL}/crear_paciente",
+            f"{PACIENTES_URL}/pacientes/crear_paciente",
             {"nombre": datos.nombre, "email": datos.email},
         )
-    return resultado
 
 
-# ---------------------------------------------------------------------------
-# Endpoint: Listar pacientes (delega al Grupo 1)
-# ---------------------------------------------------------------------------
-
-@app.get("/pacientes", tags=["Pacientes"])
+@app.get("/pacientes", tags=["Pacientes - Grupo 1"])
 async def listar_pacientes():
     """
-    Proxy hacia el servicio de Pacientes (Grupo 1).
-    Devuelve la lista de todos los pacientes registrados.
+    [Grupo 1] Devuelve la lista de todos los pacientes registrados.
     """
     async with httpx.AsyncClient() as client:
-        resultado = await http_get(client, f"{PACIENTES_URL}/pacientes")
-    return resultado
+        return await http_get(client, f"{PACIENTES_URL}/pacientes/")
 
 
-# ---------------------------------------------------------------------------
-# Endpoint: Listar doctores (delega al Grupo 2)
-# ---------------------------------------------------------------------------
+@app.get("/pacientes/{paciente_id}", tags=["Pacientes - Grupo 1"])
+async def obtener_paciente(paciente_id: int):
+    """
+    [Grupo 1] Obtiene los datos de un paciente por su ID.
+    Útil para verificar existencia antes de crear una cita.
+    """
+    async with httpx.AsyncClient() as client:
+        return await http_get(client, f"{PACIENTES_URL}/pacientes/{paciente_id}")
 
-@app.get("/doctores", tags=["Doctores"])
+
+# ===========================================================================
+# GRUPO 2 — DOCTORES
+# ===========================================================================
+
+@app.post("/crear_doctor", status_code=201, tags=["Doctores - Grupo 2"])
+async def crear_doctor(datos: CrearDoctorRequest):
+    """
+    [Grupo 2] Registra un nuevo doctor en el sistema.
+    Delega al servicio de Doctores que valida duplicados internamente.
+    """
+    log.info(f"Creando doctor: {datos.nombre} | {datos.especialidad}")
+    async with httpx.AsyncClient() as client:
+        return await http_post(
+            client,
+            f"{DOCTORES_URL}/crear_doctor",
+            {
+                "nombre":       datos.nombre,
+                "especialidad": datos.especialidad,
+                "email":        datos.email,
+            },
+        )
+
+
+@app.get("/doctores", tags=["Doctores - Grupo 2"])
 async def listar_doctores():
     """
-    Proxy hacia el servicio de Doctores (Grupo 2).
-    Devuelve la lista de todos los doctores disponibles.
+    [Grupo 2] Devuelve la lista de todos los doctores registrados.
     """
     async with httpx.AsyncClient() as client:
-        resultado = await http_get(client, f"{DOCTORES_URL}/doctores")
-    return resultado
+        return await http_get(client, f"{DOCTORES_URL}/doctores")
 
 
-# ---------------------------------------------------------------------------
-# Endpoint: Listar citas (delega al Grupo 3)
-# ---------------------------------------------------------------------------
+@app.get("/disponibilidad", tags=["Doctores - Grupo 2"])
+async def disponibilidad_doctor(doctor_id: int, horario: str):
+    """
+    [Grupo 2] Consulta si un doctor tiene disponibilidad en un horario específico.
+    Ejemplo: GET /disponibilidad?doctor_id=1&horario=8:30
+    """
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.get(
+                f"{DOCTORES_URL}/disponibilidad",
+                params={"doctor_id": doctor_id, "horario": horario},
+                timeout=TIMEOUT_CORTO,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except httpx.TimeoutException:
+            raise HTTPException(status_code=504, detail="Timeout al consultar disponibilidad")
+        except httpx.ConnectError:
+            raise HTTPException(status_code=503, detail="Servicio de doctores no disponible")
+        except httpx.HTTPStatusError as e:
+            raise HTTPException(
+                status_code=e.response.status_code,
+                detail=f"Error al consultar disponibilidad: {e.response.text}",
+            )
 
-@app.get("/citas", tags=["Citas"])
+
+# ===========================================================================
+# GRUPO 3 — CITAS
+# (La creación de citas se hace SOLO a través de /orquestar_cita)
+# ===========================================================================
+
+@app.get("/citas", tags=["Citas - Grupo 3"])
 async def listar_citas():
     """
-    Proxy hacia el servicio de Citas (Grupo 3).
-    Devuelve todas las citas creadas en el sistema.
+    [Grupo 3] Devuelve todas las citas del sistema.
+    Para crear una cita usa POST /orquestar_cita (flujo completo).
     """
     async with httpx.AsyncClient() as client:
-        resultado = await http_get(client, f"{CITAS_URL}/citas")
+        return await http_get(client, f"{CITAS_URL}/citas")
+
+
+@app.get("/citas/{cita_id}", tags=["Citas - Grupo 3"])
+async def obtener_cita(cita_id: int):
+    """
+    [Grupo 3] Obtiene los datos de una cita por su ID.
+    """
+    async with httpx.AsyncClient() as client:
+        return await http_get(client, f"{CITAS_URL}/citas/{cita_id}")
+
+
+@app.delete("/cancelar_cita/{cita_id}", tags=["Citas - Grupo 3"])
+async def cancelar_cita(cita_id: int):
+    """
+    [Grupo 3] Cancela una cita existente por su ID.
+    También libera el horario del doctor como rollback (Grupo 2).
+    """
+    async with httpx.AsyncClient() as client:
+
+        # Obtener datos de la cita para saber qué horario liberar
+        try:
+            cita = await http_get(client, f"{CITAS_URL}/citas/{cita_id}")
+        except HTTPException:
+            cita = None
+
+        # Cancelar en el Grupo 3
+        resultado = await http_delete(client, f"{CITAS_URL}/cancelar_cita/{cita_id}")
+
+        # Rollback: liberar horario del doctor en el Grupo 2
+        if cita and cita.get("doctor_id") and cita.get("horario"):
+            try:
+                await http_post(
+                    client,
+                    f"{DOCTORES_URL}/liberar_horario",
+                    {"doctor_id": cita["doctor_id"], "horario": cita["horario"]},
+                )
+                log.info(f"[Cancelar] Horario liberado — doctor {cita['doctor_id']}")
+            except Exception:
+                log.warning("[Cancelar] No se pudo liberar el horario del doctor")
+
     return resultado
 
 
-# ---------------------------------------------------------------------------
-# Endpoint principal: ORQUESTAR CITA COMPLETA
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# GRUPO 4 — PAGOS
+# (El pago se ejecuta automáticamente dentro de /orquestar_cita)
+# ===========================================================================
 
-@app.post("/orquestar_cita", tags=["Orquestación"])
+@app.get("/pagos", tags=["Pagos - Grupo 4"])
+async def listar_pagos():
+    """
+    [Grupo 4] Devuelve el historial de todos los pagos procesados.
+    El pago se genera automáticamente al usar POST /orquestar_cita.
+    """
+    async with httpx.AsyncClient() as client:
+        return await http_get(client, f"{PAGOS_URL}/pagos")
+
+
+@app.get("/pagos/{cita_id}", tags=["Pagos - Grupo 4"])
+async def obtener_pago(cita_id: str):
+    """
+    [Grupo 4] Consulta el pago asociado a una cita específica.
+    """
+    async with httpx.AsyncClient() as client:
+        return await http_get(client, f"{PAGOS_URL}/pagos/cita/{cita_id}")
+
+
+# ===========================================================================
+# GRUPO 6 — ORQUESTACIÓN PRINCIPAL
+# ===========================================================================
+
+@app.post("/orquestar_cita", tags=["Orquestación - Grupo 6"])
 async def orquestar_cita(datos: OrquestacionRequest):
     """
-    Flujo completo de creación de cita médica:
+    Flujo completo y coordinado de creación de una cita médica:
 
-    1. Verificar que el paciente existe (Grupo 1)
-    2. Verificar que el doctor existe y tiene disponibilidad (Grupo 2)
-    3. Bloquear horario del doctor via Redis (anti-duplicidad)
-    4. Crear la cita (Grupo 3) — valida que ni paciente ni doctor
-       tengan otra cita en ese mismo horario
-    5. Procesar el pago (Grupo 4) — con lock Redis anti-doble-pago
-    6. Enviar notificación al paciente (Grupo 5) — idempotente
-    7. Liberar el lock de orquestación
+      Paso 1 → Verificar que el paciente existe           (Grupo 1)
+      Paso 2 → Verificar doctor y bloquear su horario     (Grupo 2)
+      Paso 3 → Crear la cita                              (Grupo 3)
+      Paso 4 → Procesar el pago                           (Grupo 4)
+      Paso 5 → Notificar al paciente                      (Grupo 5)
 
-    Si cualquier paso falla, se reporta el error y se libera el lock.
+    Control de concurrencia:
+      - Lock Redis impide que el mismo paciente/doctor/horario
+        se procese dos veces en paralelo (nx=True, expira en 90s).
+
+    Rollback:
+      - Si el Paso 3 falla → se libera el horario del doctor (Paso 2).
+      - Si el Paso 4 o 5 fallan → se registran en 'errores' pero
+        la cita permanece activa (fallos no críticos).
     """
 
     # ------------------------------------------------------------------
-    # LOCK de orquestación: evita que el mismo paciente-doctor-horario
-    # se procese dos veces en paralelo
+    # Lock de orquestación
     # ------------------------------------------------------------------
     lock_key = f"lock:orquestacion:{datos.paciente_id}:{datos.doctor_id}:{datos.horario}"
     adquirido = r.set(lock_key, "procesando", nx=True, ex=90)
@@ -202,20 +345,21 @@ async def orquestar_cita(datos: OrquestacionRequest):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
-                f"Ya existe un proceso activo para el paciente {datos.paciente_id} "
-                f"con el doctor {datos.doctor_id} en el horario {datos.horario}. "
-                "Intenta de nuevo en unos segundos."
+                f"Ya hay un proceso activo para el paciente {datos.paciente_id} "
+                f"con el doctor {datos.doctor_id} en el horario '{datos.horario}'. "
+                "Espera unos segundos e intenta de nuevo."
             ),
         )
 
-    log.info(f"Lock adquirido: {lock_key}")
+    log.info(f"[Lock] Adquirido: {lock_key}")
+
     resultado = {
-        "paso_1_paciente":       None,
-        "paso_2_doctor":         None,
-        "paso_3_cita":           None,
-        "paso_4_pago":           None,
-        "paso_5_notificacion":   None,
-        "errores":               [],
+        "paso_1_paciente":     None,
+        "paso_2_doctor":       None,
+        "paso_3_cita":         None,
+        "paso_4_pago":         None,
+        "paso_5_notificacion": None,
+        "errores":             [],
     }
 
     try:
@@ -229,47 +373,41 @@ async def orquestar_cita(datos: OrquestacionRequest):
                 paciente = await http_get(
                     client,
                     f"{PACIENTES_URL}/pacientes/{datos.paciente_id}",
-                    timeout=TIMEOUT_CORTO,
                 )
                 resultado["paso_1_paciente"] = {
                     "id":     paciente.get("id"),
                     "nombre": paciente.get("nombre"),
                     "email":  paciente.get("email"),
                 }
-                log.info(f"[Paso 1] OK — paciente: {paciente.get('nombre')}")
+                log.info(f"[Paso 1] OK — {paciente.get('nombre')}")
             except HTTPException as e:
-                # Si el paciente no existe, no tiene sentido continuar
                 resultado["errores"].append(f"Paso 1 - Paciente: {e.detail}")
                 raise HTTPException(
                     status_code=e.status_code,
-                    detail=f"El paciente con id={datos.paciente_id} no existe o no está disponible: {e.detail}",
+                    detail=f"Paciente id={datos.paciente_id} no encontrado: {e.detail}",
                 )
 
             # ==============================================================
-            # PASO 2 — Verificar que el doctor existe y bloquear su horario (Grupo 2)
+            # PASO 2 — Verificar doctor y bloquear horario (Grupo 2)
             # ==============================================================
-            log.info(f"[Paso 2] Verificando doctor id={datos.doctor_id} y bloqueando horario")
+            log.info(f"[Paso 2] Bloqueando horario del doctor id={datos.doctor_id}")
             try:
                 bloqueo = await http_post(
                     client,
                     f"{DOCTORES_URL}/bloquear_horario",
                     {"doctor_id": datos.doctor_id, "horario": datos.horario},
-                    timeout=TIMEOUT_NORMAL,
                 )
                 resultado["paso_2_doctor"] = bloqueo
-                log.info(f"[Paso 2] OK — horario bloqueado: {bloqueo}")
+                log.info(f"[Paso 2] OK — horario bloqueado")
             except HTTPException as e:
-                # Si el doctor no existe o el horario ya está ocupado, abortamos
                 resultado["errores"].append(f"Paso 2 - Doctor/Horario: {e.detail}")
                 raise HTTPException(
                     status_code=e.status_code,
-                    detail=f"No se pudo reservar el horario con el doctor {datos.doctor_id}: {e.detail}",
+                    detail=f"No se pudo reservar horario con doctor {datos.doctor_id}: {e.detail}",
                 )
 
             # ==============================================================
             # PASO 3 — Crear la cita (Grupo 3)
-            # El servicio de citas valida internamente que no exista duplicidad
-            # para ese paciente/doctor/horario, usando su propio lock Redis
             # ==============================================================
             log.info(f"[Paso 3] Creando cita")
             cita_id: Optional[int] = None
@@ -282,14 +420,13 @@ async def orquestar_cita(datos: OrquestacionRequest):
                         "doctor_id":   datos.doctor_id,
                         "horario":     datos.horario,
                     },
-                    timeout=TIMEOUT_NORMAL,
                 )
                 resultado["paso_3_cita"] = cita
                 cita_id = cita.get("id")
-                log.info(f"[Paso 3] OK — cita creada con id={cita_id}")
+                log.info(f"[Paso 3] OK — cita id={cita_id}")
             except HTTPException as e:
                 resultado["errores"].append(f"Paso 3 - Cita: {e.detail}")
-                # Si la cita falla, liberamos el horario del doctor
+                # Rollback: liberar el horario del doctor
                 try:
                     await http_post(
                         client,
@@ -297,43 +434,39 @@ async def orquestar_cita(datos: OrquestacionRequest):
                         {"doctor_id": datos.doctor_id, "horario": datos.horario},
                         timeout=TIMEOUT_CORTO,
                     )
-                    log.info("[Paso 3] Horario del doctor liberado por fallo en cita")
+                    log.info("[Paso 3] Rollback OK: horario del doctor liberado")
                 except Exception:
-                    log.warning("[Paso 3] No se pudo liberar el horario del doctor (rollback fallido)")
+                    log.warning("[Paso 3] Rollback fallido: no se pudo liberar el horario")
                 raise HTTPException(
                     status_code=e.status_code,
                     detail=f"No se pudo crear la cita: {e.detail}",
                 )
 
             # ==============================================================
-            # PASO 4 — Procesar el pago (Grupo 4)
-            # El servicio de pagos tiene su propio lock Redis anti-doble-pago
+            # PASO 4 — Procesar el pago (Grupo 4) — fallo no crítico
             # ==============================================================
-            log.info(f"[Paso 4] Procesando pago para cita id={cita_id}")
+            log.info(f"[Paso 4] Procesando pago — cita={cita_id}, monto={datos.monto}")
             try:
                 pago = await http_post(
                     client,
                     f"{PAGOS_URL}/pagar",
                     {
-                        "cita_id":    cita_id,
+                        "cita_id":     cita_id,
                         "paciente_id": datos.paciente_id,
-                        "monto":      datos.monto,
+                        "monto":       datos.monto,
                     },
-                    timeout=TIMEOUT_LARGO,   # pagos simulan delay
+                    timeout=TIMEOUT_LARGO,
                 )
                 resultado["paso_4_pago"] = pago
-                log.info(f"[Paso 4] OK — pago procesado: {pago}")
+                log.info(f"[Paso 4] OK — pago procesado")
             except HTTPException as e:
-                # Pago fallido: registramos el error pero NO cancelamos la cita
-                # (la lógica de negocio puede decidir reintentarlo luego)
                 resultado["errores"].append(f"Paso 4 - Pago: {e.detail}")
-                log.warning(f"[Paso 4] Pago fallido para cita {cita_id}: {e.detail}")
+                log.warning(f"[Paso 4] Pago fallido (cita sigue activa): {e.detail}")
 
             # ==============================================================
-            # PASO 5 — Notificar al paciente (Grupo 5)
-            # El servicio de notificaciones es idempotente (no duplica envíos)
+            # PASO 5 — Notificar al paciente (Grupo 5) — fallo no crítico
             # ==============================================================
-            log.info(f"[Paso 5] Enviando notificación para cita id={cita_id}")
+            log.info(f"[Paso 5] Notificando paciente id={datos.paciente_id}")
             try:
                 notif = await http_post(
                     client,
@@ -344,25 +477,21 @@ async def orquestar_cita(datos: OrquestacionRequest):
                         "cita_id":     cita_id,
                         "mensaje": (
                             f"Tu cita con el doctor {datos.doctor_id} "
-                            f"para el {datos.horario} ha sido confirmada. "
-                            f"Monto pagado: ${datos.monto:,.0f}."
+                            f"el {datos.horario} ha sido confirmada. "
+                            f"Monto: ${datos.monto:,.0f}."
                         ),
                     },
-                    timeout=TIMEOUT_NORMAL,
                 )
                 resultado["paso_5_notificacion"] = notif
                 log.info(f"[Paso 5] OK — notificación enviada")
             except HTTPException as e:
-                # Notificación fallida: no es crítica, solo registramos
                 resultado["errores"].append(f"Paso 5 - Notificación: {e.detail}")
                 log.warning(f"[Paso 5] Notificación fallida: {e.detail}")
 
     finally:
-        # Siempre liberamos el lock al terminar (éxito o excepción)
         r.delete(lock_key)
-        log.info(f"Lock liberado: {lock_key}")
+        log.info(f"[Lock] Liberado: {lock_key}")
 
-    # Determinar si el proceso fue exitoso (cita creada = éxito mínimo)
     exito = resultado["paso_3_cita"] is not None
     return {
         "exito":   exito,
@@ -371,63 +500,22 @@ async def orquestar_cita(datos: OrquestacionRequest):
     }
 
 
-# ---------------------------------------------------------------------------
-# Endpoint: Cancelar cita (delega al Grupo 3)
-# ---------------------------------------------------------------------------
-
-@app.delete("/cancelar_cita/{cita_id}", tags=["Citas"])
-async def cancelar_cita(cita_id: int):
-    """
-    Proxy hacia el servicio de Citas (Grupo 3).
-    Cancela una cita existente por su ID.
-    Nota: también intenta liberar el horario del doctor si la cita existe.
-    """
-    async with httpx.AsyncClient() as client:
-
-        # Primero obtenemos los datos de la cita para saber doctor/horario
-        try:
-            cita = await http_get(client, f"{CITAS_URL}/citas/{cita_id}")
-        except HTTPException:
-            cita = None  # Si no podemos obtenerla, igual intentamos cancelar
-
-        # Cancelar en el servicio de citas
-        resultado = await http_post(
-            client,
-            f"{CITAS_URL}/cancelar_cita",
-            {"cita_id": cita_id},
-        )
-
-        # Si teníamos los datos, intentamos liberar el horario del doctor
-        if cita and cita.get("doctor_id") and cita.get("horario"):
-            try:
-                await http_post(
-                    client,
-                    f"{DOCTORES_URL}/liberar_horario",
-                    {"doctor_id": cita["doctor_id"], "horario": cita["horario"]},
-                )
-                log.info(f"Horario liberado para doctor {cita['doctor_id']}")
-            except Exception:
-                log.warning("No se pudo liberar el horario del doctor al cancelar la cita")
-
-    return resultado
-
-
-# ---------------------------------------------------------------------------
-# Endpoint: Estado de todos los servicios
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# SALUD DEL SISTEMA
+# ===========================================================================
 
 @app.get("/estado_servicios", tags=["Salud"])
 async def estado_servicios():
     """
-    Verifica el estado de todos los microservicios del sistema.
-    Útil para diagnóstico rápido.
+    Verifica el estado (health) de todos los microservicios y de Redis.
+    Útil para diagnóstico antes de ejecutar pruebas.
     """
     servicios = {
-        "pacientes":      f"{PACIENTES_URL}",
-        "doctores":       f"{DOCTORES_URL}",
-        "citas":          f"{CITAS_URL}",
-        "pagos":          f"{PAGOS_URL}/health",
-        "notificaciones": f"{NOTIFICACIONES_URL}",
+        "pacientes (G1)":      f"{PACIENTES_URL}",
+        "doctores (G2)":       f"{DOCTORES_URL}",
+        "citas (G3)":          f"{CITAS_URL}",
+        "pagos (G4)":          f"{PAGOS_URL}/health",
+        "notificaciones (G5)": f"{NOTIFICACIONES_URL}",
     }
     estados = {}
 
@@ -441,7 +529,6 @@ async def estado_servicios():
             except httpx.TimeoutException:
                 estados[nombre] = "timeout"
 
-    # Estado de Redis
     try:
         r.ping()
         redis_estado = "ok"
@@ -458,11 +545,7 @@ async def estado_servicios():
     }
 
 
-# ---------------------------------------------------------------------------
-# Health check del propio orquestador
-# ---------------------------------------------------------------------------
-
 @app.get("/health", tags=["Salud"])
 def health():
-    """Verifica que el servicio coordinador está activo."""
-    return {"status": "ok", "servicio": "coordinador", "version": "2.0"}
+    """Health check del propio coordinador."""
+    return {"status": "ok", "servicio": "coordinador", "version": "3.0"}
