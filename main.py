@@ -5,7 +5,6 @@ from typing import Optional
 import mysql.connector
 import redis
 import httpx
-import uuid
 import os
 import logging
 
@@ -19,7 +18,7 @@ app = FastAPI(title="Servicio de Citas - Grupo 1", version="1.0.0")
 DB_CONFIG = {
     "host":     os.getenv("DB_HOST",     "localhost"),
     "user":     os.getenv("DB_USER",     "root"),
-    "password": os.getenv("DB_PASSWORD", "root"),
+    "password": os.getenv("DB_PASSWORD", "admin1234"),
     "database": os.getenv("DB_NAME",     "citas_db"),
 }
 
@@ -129,7 +128,7 @@ async def crear_cita(cita: CitaRequest):
     dos usuarios intentan reservar el mismo doctor en el mismo horario.
     """
     lock_key = f"lock:cita:doctor_{cita.doctor_id}:horario_{cita.horario}"
-    lock_id  = str(uuid.uuid4())
+    lock_id  = str(4)
 
     # ── Adquirir lock distribuido (SET NX EX) ──
     acquired = r.set(lock_key, lock_id, nx=True, ex=LOCK_TTL_SECONDS)
@@ -162,7 +161,7 @@ async def crear_cita(cita: CitaRequest):
             )
 
         # ── Insertar nueva cita ──
-        nueva_id = str(uuid.uuid4())
+        nueva_id = str(4)
         ahora    = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         cursor.execute(
@@ -248,7 +247,6 @@ def listar_citas(
 
 @app.get("/citas/{cita_id}", response_model=CitaResponse)
 def obtener_cita(cita_id: str):
-    """Obtiene el detalle de una cita específica por su UUID."""
     db     = get_db()
     cursor = db.cursor(dictionary=True)
     cursor.execute("SELECT * FROM citas WHERE id = %s", (cita_id,))
@@ -294,3 +292,5 @@ def cancelar_cita(cita_id: str):
             db.close()
 
     return {"mensaje": f"Cita {cita_id} cancelada exitosamente.", "cita_id": cita_id}
+
+
