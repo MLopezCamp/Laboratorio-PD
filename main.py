@@ -50,7 +50,7 @@ def init_db():
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS citas (
             id          VARCHAR(36)  PRIMARY KEY,
-            paciente_id INT          NOT NULL,
+            paciente_id VARCHAR(36)  NOT NULL,
             doctor_id   INT          NOT NULL,
             horario     VARCHAR(50)  NOT NULL,
             estado      VARCHAR(20)  NOT NULL DEFAULT 'confirmada',
@@ -71,14 +71,14 @@ def startup():
 # ─── Modelos ──────────────────────────────────────────────────────────────────
 
 class CitaRequest(BaseModel):
-    paciente_id: int
+    paciente_id: str
     doctor_id:   int
     horario:     str          # e.g. "2025-06-10T09:00"
 
 
 class CitaResponse(BaseModel):
     id:          str
-    paciente_id: int
+    paciente_id: str
     doctor_id:   int
     horario:     str
     estado:      str
